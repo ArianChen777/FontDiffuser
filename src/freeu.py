@@ -14,6 +14,12 @@ FreeU is applied only to the two up_blocks closest to the bottleneck:
 Both the original UpBlock2D forward and the StyleRSI forward are monkey-patched
 at the instance level so the rest of the model is untouched.
 
+Design decisions vs. naive port:
+  1. Backbone scaling is applied ONCE per block (before the resnet loop),
+     not once per resnet iteration, to avoid cumulative b^N amplification.
+  2. For StyleRSIUpBlock2D, Fourier_filter is applied AFTER DCN alignment
+     so the structural offset computation sees unfiltered skip features.
+
 Experiment sweep (fix s=0.9, threshold=1*, vary b):
   b = 1.0 → 1.2 → 1.4 → 1.6
 
@@ -107,8 +113,9 @@ def _scale_backbone(hidden_states, b):
 def _patch_upblock(block, b, s, threshold):
     """Monkey-patch UpBlock2D instance with FreeU.
 
-    Inserts backbone scaling + Fourier filter on the skip connection
-    before each concat in the resnet loop.
+    Backbone scaling is applied ONCE before the resnet loop (not per
+    iteration) to avoid cumulative b^N amplification across the 3 resnets.
+    Each skip connection is Fourier-filtered individually inside the loop.
     """
     block.freeu_b = b
     block.freeu_s = s
@@ -116,13 +123,16 @@ def _patch_upblock(block, b, s, threshold):
 
     def forward(self, hidden_states, res_hidden_states_tuple,
                 temb=None, upsample_size=None):
+        # ── FreeU: backbone scaling applied ONCE per block ─────────────────
+        hidden_states = _scale_backbone(hidden_states, self.freeu_b)
+        # ───────────────────────────────────────────────────────────────────
+
         for resnet in self.resnets:
             # pop skip connection
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
 
-            # ── FreeU ──────────────────────────────────────────────────────
-            hidden_states = _scale_backbone(hidden_states, self.freeu_b)
+            # ── FreeU: filter each skip connection individually ─────────────
             res_hidden_states = Fourier_filter(
                 res_hidden_states, self.freeu_threshold, self.freeu_s)
             # ───────────────────────────────────────────────────────────────
@@ -151,9 +161,12 @@ def _patch_upblock(block, b, s, threshold):
 def _patch_stylersI_upblock(block, b, s, threshold):
     """Monkey-patch StyleRSIUpBlock2D instance with FreeU.
 
-    Inserts backbone scaling + Fourier filter on the skip connection
-    *before* the DCN offset alignment step in each iteration, so that
-    the DCN sees a noise-reduced skip feature when computing offsets.
+    Backbone scaling is applied ONCE before the resnet loop.
+
+    Fourier_filter is applied AFTER DCN alignment (not before), so that
+    the DCN's offset computation uses the original unfiltered skip features
+    for correct structural alignment. The FreeU filter then attenuates
+    high-frequency noise in the already-aligned skip before concatenation.
     """
     block.freeu_b = b
     block.freeu_s = s
@@ -166,6 +179,10 @@ def _patch_stylersI_upblock(block, b, s, threshold):
         total_offset = 0
         style_content_feat = style_structure_features[-self.upblock_index - 2]
 
+        # ── FreeU: backbone scaling applied ONCE per block ─────────────────
+        hidden_states = _scale_backbone(hidden_states, self.freeu_b)
+        # ───────────────────────────────────────────────────────────────────
+
         for sc_inter_offset, dcn_deform, resnet, attn in zip(
             self.sc_interpreter_offsets, self.dcn_deforms,
             self.resnets, self.attentions
@@ -174,13 +191,7 @@ def _patch_stylersI_upblock(block, b, s, threshold):
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
 
-            # ── FreeU ──────────────────────────────────────────────────────
-            hidden_states = _scale_backbone(hidden_states, self.freeu_b)
-            res_hidden_states = Fourier_filter(
-                res_hidden_states, self.freeu_threshold, self.freeu_s)
-            # ───────────────────────────────────────────────────────────────
-
-            # Original StyleRSI: DCN spatial alignment
+            # Original StyleRSI: DCN spatial alignment on unfiltered skip
             offset = sc_inter_offset(res_hidden_states, style_content_feat)
             offset = offset.contiguous()
             offset_sum = torch.mean(torch.abs(offset))
@@ -188,6 +199,11 @@ def _patch_stylersI_upblock(block, b, s, threshold):
 
             res_hidden_states = res_hidden_states.contiguous()
             res_hidden_states = dcn_deform(res_hidden_states, offset)
+
+            # ── FreeU: filter AFTER DCN so structural offsets are unaffected
+            res_hidden_states = Fourier_filter(
+                res_hidden_states, self.freeu_threshold, self.freeu_s)
+            # ───────────────────────────────────────────────────────────────
 
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
