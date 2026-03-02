@@ -15,6 +15,7 @@ from src import (FontDiffuserDPMPipeline,
                  build_unet,
                  build_content_encoder,
                  build_style_encoder)
+from src.freeu import apply_freeu
 from utils import (ttf2im,
                    load_ttf,
                    is_char_in_font,
@@ -40,6 +41,17 @@ def arg_parse():
                         help="The saving directory.")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--ttf_path", type=str, default="ttf/KaiXinSongA.ttf")
+    # FreeU arguments (inference-time only, no retraining needed)
+    # Sweep b over [1.0, 1.2, 1.4, 1.6]; fix s=0.9, threshold=1
+    parser.add_argument("--freeu_b", type=float, default=None,
+                        help="FreeU backbone amplification factor. "
+                             "When set, FreeU is enabled. Try 1.0/1.2/1.4/1.6. "
+                             "Set to None (default) to disable FreeU.")
+    parser.add_argument("--freeu_s", type=float, default=0.9,
+                        help="FreeU skip-connection low-frequency scale (fixed at 0.9).")
+    parser.add_argument("--freeu_threshold", type=float, default=1.0,
+                        help="FreeU FFT center half-width in pixels (fixed at 1). "
+                             "Values < 1 are rounded up to 1.")
     args = parser.parse_args()
     style_image_size = args.style_image_size
     content_image_size = args.content_image_size
@@ -105,6 +117,13 @@ def load_fontdiffuer_pipeline(args):
         content_encoder=content_encoder)
     model.to(args.device)
     print("Loaded the model state_dict successfully!")
+
+    # Apply FreeU if requested (patches up_block[0] and up_block[1] in-place)
+    if args.freeu_b is not None:
+        apply_freeu(model,
+                    b=args.freeu_b,
+                    s=args.freeu_s,
+                    threshold=args.freeu_threshold)
 
     # Load the training ddpm_scheduler.
     train_scheduler = build_ddpm_scheduler(args=args)
